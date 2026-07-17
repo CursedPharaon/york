@@ -1,38 +1,51 @@
+
+
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import sqlite3
-import os
+import requests
 import json
 import time
 import hashlib
+import os
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-# ========== ТВОЯ БАЗА ==========
-DB_PATH = "york.db"  # SQLite локально, но для Turso используем URL
+# ========== ПОДКЛЮЧЕНИЕ К TURSO ЧЕРЕЗ HTTP API ==========
+TURSO_URL = "libsql://york-cursedd.aws-eu-west-1.turso.io"  # Твой URL базы
+TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODQzMTgzMTQsImlkIjoiMDE5ZjZmNzgtZGEwMS03ZmMwLThjNzgtOWUwNTIxYzdjMGIyIiwia2lkIjoicWpYbEhLbElGQmJNX29uRDlaWEkyWFVfazVBT3h3X3JIMF9TcUZ6MmU0ZyIsInJpZCI6ImRhMmVhODNiLTM0NTYtNDYwNy1iMmJiLTFmNWY1NWM0MDFhMiJ9.OBuKhFXzEJZO2JNPqQdRzOtsbdzHjADvFf5fAY-rcvJ-9Uu9rWmJHlmCeilammNOG8RRXpz1QTNbDGeuxKCSAQ"
 
-# Для Turso используй libsql_client
-import libsql_client
+def execute_query(sql, params=None):
+    """Отправляет SQL-запрос в Turso через HTTP API"""
+    headers = {
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {"sql": sql}
+    if params:
+        data["args"] = params
+    try:
+        response = requests.post(TURSO_URL, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        return result.get("result", {})
+    except Exception as e:
+        print(f"Ошибка выполнения SQL: {e}")
+        return {"error": str(e)}
 
-TURSO_URL = "libsql://york-cursedd.aws-eu-west-1.turso.io"  # ЗАМЕНИ НА ТВОЙ URL
-TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODQzMTgzMTQsImlkIjoiMDE5ZjZmNzgtZGEwMS03ZmMwLThjNzgtOWUwNTIxYzdjMGIyIiwia2lkIjoicWpYbEhLbElGQmJNX29uRDlaWEkyWFVfazVBT3h3X3JIMF9TcUZ6MmU0ZyIsInJpZCI6ImRhMmVhODNiLTM0NTYtNDYwNy1iMmJiLTFmNWY1NWM0MDFhMiJ9.OBuKhFXzEJZO2JNPqQdRzOtsbdzHjADvFf5fAY-rcvJ-9Uu9rWmJHlmCeilammNOG8RRXpz1QTNbDGeuxKCSAQ"  # ЗАМЕНИ НА ТВОЙ ТОКЕН
-
-def get_db():
-    return libsql_client.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-
-# ========== ВСЕ ТАБЛИЦЫ ДЛЯ ТВОЕЙ БАЗЫ ==========
+# ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ==========
 def init_db():
-    conn = get_db()
-    conn.execute("""
+    # Таблица игроков
+    execute_query("""
         CREATE TABLE IF NOT EXISTS players (
             username TEXT PRIMARY KEY,
             password TEXT,
             is_admin INTEGER DEFAULT 0
         )
     """)
-    conn.execute("""
+    # Таблица ресурсов
+    execute_query("""
         CREATE TABLE IF NOT EXISTS resources (
             username TEXT PRIMARY KEY,
             wood INTEGER DEFAULT 0,
@@ -45,7 +58,8 @@ def init_db():
             upgraded_dynamite INTEGER DEFAULT 0
         )
     """)
-    conn.execute("""
+    # Таблица мира
+    execute_query("""
         CREATE TABLE IF NOT EXISTS world (
             x INTEGER,
             y INTEGER,
@@ -56,7 +70,8 @@ def init_db():
             PRIMARY KEY (x, y, server_id)
         )
     """)
-    conn.execute("""
+    # Таблица чата
+    execute_query("""
         CREATE TABLE IF NOT EXISTS chat (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
@@ -65,7 +80,8 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    conn.execute("""
+    # Таблица серверов
+    execute_query("""
         CREATE TABLE IF NOT EXISTS servers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -76,14 +92,12 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Добавляем твой аккаунт
-    conn.execute("INSERT OR IGNORE INTO players (username, password, is_admin) VALUES ('cursed_pharaon', ?, 1)", 
-                 (hashlib.sha256('lokaloka1472'.encode()).hexdigest(),))
-    # Добавляем сервер York Wibe
-    conn.execute("INSERT OR IGNORE INTO servers (id, name, admin, size, wipe_days) VALUES (1, 'York Wibe', 'cursed_pharaon', 150, 30)")
-    conn.commit()
-    conn.close()
-    print("✅ База данных york инициализирована!")
+    # Добавляем админа
+    execute_query("INSERT OR IGNORE INTO players (username, password, is_admin) VALUES ('cursed_pharaon', ?, 1)", 
+                  (hashlib.sha256('lokaloka1472'.encode()).hexdigest(),))
+    # Добавляем сервер
+    execute_query("INSERT OR IGNORE INTO servers (id, name, admin, size, wipe_days) VALUES (1, 'York Wibe', 'cursed_pharaon', 150, 30)")
+    print("✅ База данных инициализирована!")
 
 # ========== ВСЕ МАРШРУТЫ ==========
 @app.route('/login', methods=['POST'])
@@ -94,12 +108,13 @@ def login():
     if not username or not password:
         return jsonify({'success': False, 'error': 'Заполните все поля'})
     
-    conn = get_db()
-    cur = conn.execute("SELECT username, password, is_admin FROM players WHERE username=?", (username,))
-    user = cur.fetchone()
-    conn.close()
+    result = execute_query("SELECT username, password, is_admin FROM players WHERE username=?", (username,))
+    rows = result.get('rows', [])
+    if not rows:
+        return jsonify({'success': False, 'error': 'Неверный логин или пароль'})
     
-    if not user or user[1] != hashlib.sha256(password.encode()).hexdigest():
+    user = rows[0]
+    if user[1] != hashlib.sha256(password.encode()).hexdigest():
         return jsonify({'success': False, 'error': 'Неверный логин или пароль'})
     
     return jsonify({'success': True, 'is_admin': user[2] == 1})
@@ -112,28 +127,23 @@ def register():
     if not username or not password:
         return jsonify({'success': False, 'error': 'Заполните все поля'})
     
-    conn = get_db()
-    cur = conn.execute("SELECT username FROM players WHERE username=?", (username,))
-    if cur.fetchone():
-        conn.close()
+    result = execute_query("SELECT username FROM players WHERE username=?", (username,))
+    if result.get('rows'):
         return jsonify({'success': False, 'error': 'Пользователь уже существует'})
     
-    conn.execute("INSERT INTO players (username, password) VALUES (?, ?)", 
-                 (username, hashlib.sha256(password.encode()).hexdigest()))
-    conn.execute("INSERT INTO resources (username) VALUES (?)", (username,))
-    conn.commit()
-    conn.close()
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+    execute_query("INSERT INTO players (username, password) VALUES (?, ?)", (username, hashed))
+    execute_query("INSERT INTO resources (username) VALUES (?)", (username,))
     return jsonify({'success': True})
 
 @app.route('/get_resources', methods=['POST'])
 def get_resources():
     data = request.json
     username = data.get('username')
-    conn = get_db()
-    cur = conn.execute("SELECT wood, stone, iron, dynamite, gold, pickaxe, axe, upgraded_dynamite FROM resources WHERE username=?", (username,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
+    result = execute_query("SELECT wood, stone, iron, dynamite, gold, pickaxe, axe, upgraded_dynamite FROM resources WHERE username=?", (username,))
+    rows = result.get('rows', [])
+    if rows:
+        row = rows[0]
         return jsonify({
             'wood': row[0] or 0,
             'stone': row[1] or 0,
@@ -150,26 +160,21 @@ def get_resources():
 def save_resources():
     data = request.json
     username = data.get('username')
-    conn = get_db()
-    conn.execute("""
+    execute_query("""
         UPDATE resources SET wood=?, stone=?, iron=?, dynamite=?, gold=?, pickaxe=?, axe=?, upgraded_dynamite=?
         WHERE username=?
     """, (data.get('wood', 0), data.get('stone', 0), data.get('iron', 0), 
           data.get('dynamite', 0), data.get('gold', 0), data.get('pickaxe', 0), 
           data.get('axe', 0), data.get('upgraded_dynamite', 0), username))
-    conn.commit()
-    conn.close()
     return jsonify({'success': True})
 
 @app.route('/get_world', methods=['POST'])
 def get_world():
     data = request.json
     server_id = data.get('server_id', 1)
-    conn = get_db()
-    rows = conn.execute("SELECT x, y, block_type, owner, house_level FROM world WHERE server_id=?", (server_id,)).fetchall()
-    conn.close()
+    result = execute_query("SELECT x, y, block_type, owner, house_level FROM world WHERE server_id=?", (server_id,))
     world = {}
-    for row in rows:
+    for row in result.get('rows', []):
         world[f"{row[0]},{row[1]}"] = {
             'type': row[2],
             'owner': row[3],
@@ -182,47 +187,38 @@ def save_world():
     data = request.json
     server_id = data.get('server_id', 1)
     cells = data.get('cells')
-    conn = get_db()
-    conn.execute("DELETE FROM world WHERE server_id=?", (server_id,))
+    
+    execute_query("DELETE FROM world WHERE server_id=?", (server_id,))
     for key, val in cells.items():
         x, y = map(int, key.split(','))
-        conn.execute("""
+        execute_query("""
             INSERT INTO world (x, y, block_type, owner, house_level, server_id)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (x, y, val['type'], val.get('owner'), val.get('house_level', 1), server_id))
-    conn.commit()
-    conn.close()
     return jsonify({'success': True})
 
 @app.route('/send_chat', methods=['POST'])
 def send_chat():
     data = request.json
-    conn = get_db()
-    conn.execute("INSERT INTO chat (username, message, server_id) VALUES (?, ?, ?)",
+    execute_query("INSERT INTO chat (username, message, server_id) VALUES (?, ?, ?)",
                  (data['username'], data['message'], data.get('server_id', 1)))
-    conn.commit()
-    conn.close()
     return jsonify({'success': True})
 
 @app.route('/get_chat', methods=['POST'])
 def get_chat():
     data = request.json
     server_id = data.get('server_id', 1)
-    conn = get_db()
-    rows = conn.execute("SELECT username, message, timestamp FROM chat WHERE server_id=? ORDER BY id DESC LIMIT 50", (server_id,)).fetchall()
-    conn.close()
+    result = execute_query("SELECT username, message, timestamp FROM chat WHERE server_id=? ORDER BY id DESC LIMIT 50", (server_id,))
     chat = []
-    for row in reversed(rows):
+    for row in reversed(result.get('rows', [])):
         chat.append({'user': row[0], 'msg': row[1], 'time': row[2]})
     return jsonify(chat)
 
 @app.route('/get_servers', methods=['POST'])
 def get_servers():
-    conn = get_db()
-    rows = conn.execute("SELECT id, name, admin, size, wipe_days, tariff FROM servers ORDER BY id").fetchall()
-    conn.close()
+    result = execute_query("SELECT id, name, admin, size, wipe_days, tariff FROM servers ORDER BY id")
     servers = []
-    for row in rows:
+    for row in result.get('rows', []):
         servers.append({
             'id': row[0],
             'name': row[1],
@@ -239,10 +235,8 @@ def stream_chat():
         last_id = 0
         while True:
             try:
-                conn = get_db()
-                rows = conn.execute("SELECT id, username, message, timestamp FROM chat WHERE id > ? ORDER BY id ASC", (last_id,)).fetchall()
-                conn.close()
-                for row in rows:
+                result = execute_query("SELECT id, username, message, timestamp FROM chat WHERE id > ? ORDER BY id ASC", (last_id,))
+                for row in result.get('rows', []):
                     last_id = row[0]
                     yield f"data: {json.dumps({'user': row[1], 'msg': row[2], 'time': row[3]})}\n\n"
                 time.sleep(0.5)
