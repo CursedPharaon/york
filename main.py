@@ -16,8 +16,8 @@ DB_PATH = "york.db"  # SQLite локально, но для Turso использ
 # Для Turso используй libsql_client
 import libsql_client
 
-TURSO_URL = "libsql://york-ваш-хэндл.turso.io"  # ЗАМЕНИ НА ТВОЙ URL
-TURSO_TOKEN = "твой_токен"  # ЗАМЕНИ НА ТВОЙ ТОКЕН
+TURSO_URL = "libsql://york-cursedd.aws-eu-west-1.turso.io"  # ЗАМЕНИ НА ТВОЙ URL
+TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODQzMTgzMTQsImlkIjoiMDE5ZjZmNzgtZGEwMS03ZmMwLThjNzgtOWUwNTIxYzdjMGIyIiwia2lkIjoicWpYbEhLbElGQmJNX29uRDlaWEkyWFVfazVBT3h3X3JIMF9TcUZ6MmU0ZyIsInJpZCI6ImRhMmVhODNiLTM0NTYtNDYwNy1iMmJiLTFmNWY1NWM0MDFhMiJ9.OBuKhFXzEJZO2JNPqQdRzOtsbdzHjADvFf5fAY-rcvJ-9Uu9rWmJHlmCeilammNOG8RRXpz1QTNbDGeuxKCSAQ"  # ЗАМЕНИ НА ТВОЙ ТОКЕН
 
 def get_db():
     return libsql_client.connect(TURSO_URL, auth_token=TURSO_TOKEN)
