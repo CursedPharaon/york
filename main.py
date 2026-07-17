@@ -1,12 +1,10 @@
 import sys
 import subprocess
 
-# === АВТОУСТАНОВКА ===
 try:
     import libsql_client
     import flask
 except ImportError:
-    print("📦 Устанавливаю зависимости...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "flask", "flask-cors", "libsql-client"])
 
 from flask import Flask, request, jsonify
@@ -17,15 +15,15 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# ========== НАСТРОЙКИ TURSO ==========
-TURSO_URL = "libsql://vk-bot-cursedd.aws-eu-west-1.turso.io"
-TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODQyOTA1NDAsImlkIjoiMDE5ZjcwMDAtOTcwMS03NDJjLWIwM2EtNzA0MTQ2MDk4ZWI2Iiwia2lkIjoicWpYbEhLbElGQmJNX29uRDlaWEkyWFVfazVBT3h3X3JIMF9TcUZ6MmU0ZyIsInJpZCI6ImM3OTFiYzM5LTg3YjktNDgwZC1iZjRkLTEwMDdiNTI1YTg2NCJ9.rvnr8-mOPA7ydTmVKb1C4QDIxA_se-HSIiGQX5OaJ9vnj89C4xJ5PZnHn5ldw4eQMf-5pRXztvisg-chcKj4Dw"
+# ========== ОСНОВНАЯ БАЗА ДАННЫХ YORK ==========
+TURSO_URL = "https://york-cursedd.aws-eu-west-1.turso.io"
+TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjE3ODQ4ODY0NzIsImlhdCI6MTc4NDI4MTY3MiwiaWQiOiIwMTlmNmY3OC1kYTAxLTdmYzAtOGM3OC05ZTA1MjFjN2MwYjIiLCJraWQiOiJxalhsSEtsSUZCYk1fb25EOVpYSTJYVV9rNUFPeHdfckgwX1NxRnoyZTRnIiwicmlkIjoiZGEyZWE4M2ItMzQ1Ni00NjA3LWIyYmItMWY1ZjU1YzQwMWEyIn0.J3VAh7UK1Rld-CUWF8FEsqDPYmXGb16fMn3EqygEdIVHuzYdCPqUwGhOgPxwPunXCNwXiGjE7Oo0Nq4V8fK-DQ"
 
 def get_db():
-    # Правильный синтаксис для libsql-client
     return libsql_client.create_client_sync(
         url=TURSO_URL,
-        auth_token=TURSO_TOKEN
+        auth_token=TURSO_TOKEN,
+        tls=True
     )
 
 # ========== ПОЛУЧИТЬ ВСЕ СЕРВЕРА ==========
