@@ -1,13 +1,14 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import sqlite3
 import os
 import random
+import json
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-# === Настройка базы ===
 def get_db():
     conn = sqlite3.connect('york.db')
     conn.row_factory = sqlite3.Row
@@ -54,19 +55,17 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     ''')
-    # Админ
     cur.execute("INSERT OR IGNORE INTO players (username, password, is_admin) VALUES ('cursed_pharaon', 'lokaloka1472', 1)")
     cur.execute("INSERT OR IGNORE INTO resources (username, wood, stone, iron, dynamite, gold) VALUES ('cursed_pharaon', 100, 50, 20, 10, 5)")
     cur.execute("INSERT OR IGNORE INTO servers (id, name, admin, size, wipe_days) VALUES (1, 'York Wibe', 'cursed_pharaon', 150, 30)")
     
-    # Генерация мира, если пусто
     cur.execute("SELECT COUNT(*) FROM world")
     if cur.fetchone()[0] == 0:
         size = 150
         for x in range(size):
             for y in range(size):
                 r = random.random()
-                if r < 0.10:
+                if r < 0.15:
                     block = 'water'
                 elif r < 0.30:
                     block = 'stone'
@@ -168,18 +167,6 @@ def save_world():
     conn.close()
     return jsonify({'success': True})
 
-@app.route('/get_chat', methods=['POST'])
-def get_chat():
-    data = request.json
-    server_id = data.get('server_id', 1)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT username, message, timestamp FROM chat WHERE server_id=? ORDER BY id DESC LIMIT 50", (server_id,))
-    rows = cur.fetchall()
-    conn.close()
-    chat = [{'user': row['username'], 'msg': row['message'], 'time': row['timestamp']} for row in reversed(rows)]
-    return jsonify(chat)
-
 @app.route('/send_chat', methods=['POST'])
 def send_chat():
     data = request.json
@@ -190,6 +177,36 @@ def send_chat():
     conn.commit()
     conn.close()
     return jsonify({'success': True})
+
+@app.route('/get_servers', methods=['GET'])
+def get_servers():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM servers")
+    rows = cur.fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in rows])
+
+# === SSE: Чат в реальном времени ===
+@app.route('/stream_chat')
+def stream_chat():
+    def generate():
+        last_id = 0
+        while True:
+            try:
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute("SELECT id, username, message, timestamp FROM chat WHERE id > ? ORDER BY id ASC", (last_id,))
+                rows = cur.fetchall()
+                conn.close()
+                for row in rows:
+                    last_id = row['id']
+                    yield f"data: {json.dumps({'user': row['username'], 'msg': row['message'], 'time': row['timestamp']})}\n\n"
+                time.sleep(0.5)
+            except Exception as e:
+                print("SSE ошибка:", e)
+                time.sleep(1)
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
 if __name__ == '__main__':
     init_db()
