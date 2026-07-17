@@ -1,20 +1,18 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
-import json
 import os
 import random
 
 app = Flask(__name__)
 CORS(app)
 
-# Подключение к Turso
+# === Настройка базы ===
 def get_db():
     conn = sqlite3.connect('york.db')
     conn.row_factory = sqlite3.Row
     return conn
 
-# Создание таблиц, если их нет
 def init_db():
     conn = get_db()
     cur = conn.cursor()
@@ -28,26 +26,24 @@ def init_db():
             username TEXT PRIMARY KEY,
             wood INTEGER DEFAULT 0,
             stone INTEGER DEFAULT 0,
-            dynamite INTEGER DEFAULT 0
+            iron INTEGER DEFAULT 0,
+            dynamite INTEGER DEFAULT 0,
+            gold INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS world (
             x INTEGER,
             y INTEGER,
             block_type TEXT,
             owner TEXT,
-            PRIMARY KEY (x, y)
+            server_id INTEGER DEFAULT 1,
+            PRIMARY KEY (x, y, server_id)
         );
         CREATE TABLE IF NOT EXISTS chat (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
             message TEXT,
+            server_id INTEGER DEFAULT 1,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS worlds (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            owner TEXT,
-            data TEXT
         );
         CREATE TABLE IF NOT EXISTS servers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,46 +54,61 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     ''')
-    # Добавляем админа, если его нет
-    cur.execute("INSERT OR IGNORE INTO players (username, password, is_admin) VALUES (?, ?, ?)",
-                ('cursed_pharaon', 'lokaloka1472', 1))
-    # Добавляем ресурсы админа
-    cur.execute("INSERT OR IGNORE INTO resources (username, wood, stone, dynamite) VALUES (?, ?, ?, ?)",
-                ('cursed_pharaon', 100, 50, 10))
-    # Добавляем сервер
+    # Админ
+    cur.execute("INSERT OR IGNORE INTO players (username, password, is_admin) VALUES ('cursed_pharaon', 'lokaloka1472', 1)")
+    cur.execute("INSERT OR IGNORE INTO resources (username, wood, stone, iron, dynamite, gold) VALUES ('cursed_pharaon', 100, 50, 20, 10, 5)")
     cur.execute("INSERT OR IGNORE INTO servers (id, name, admin, size, wipe_days) VALUES (1, 'York Wibe', 'cursed_pharaon', 150, 30)")
+    
+    # Генерация мира, если пусто
+    cur.execute("SELECT COUNT(*) FROM world")
+    if cur.fetchone()[0] == 0:
+        size = 150
+        for x in range(size):
+            for y in range(size):
+                r = random.random()
+                if r < 0.10:
+                    block = 'water'
+                elif r < 0.30:
+                    block = 'stone'
+                elif r < 0.50:
+                    block = 'tree'
+                elif r < 0.55:
+                    block = 'iron'
+                elif r < 0.58:
+                    block = 'gold'
+                else:
+                    block = 'grass'
+                cur.execute("INSERT INTO world (x, y, block_type, server_id) VALUES (?, ?, ?, 1)", (x, y, block))
+    
     conn.commit()
     conn.close()
 
-# ========== API ==========
-
+# === API ===
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
-    username = data.get('username')
-    password = data.get('password')
+    user, pwd = data.get('username'), data.get('password')
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM players WHERE username=?", (username,))
-    user = cur.fetchone()
+    cur.execute("SELECT * FROM players WHERE username=? AND password=?", (user, pwd))
+    row = cur.fetchone()
     conn.close()
-    if user and user['password'] == password:
-        return jsonify({'success': True, 'is_admin': user['is_admin']})
+    if row:
+        return jsonify({'success': True, 'is_admin': row['is_admin']})
     return jsonify({'success': False, 'error': 'Неверный логин или пароль'})
 
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
-    username = data.get('username')
-    password = data.get('password')
+    user, pwd = data.get('username'), data.get('password')
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM players WHERE username=?", (username,))
+    cur.execute("SELECT * FROM players WHERE username=?", (user,))
     if cur.fetchone():
         conn.close()
         return jsonify({'success': False, 'error': 'Игрок уже существует'})
-    cur.execute("INSERT INTO players (username, password) VALUES (?, ?)", (username, password))
-    cur.execute("INSERT INTO resources (username, wood, stone, dynamite) VALUES (?, ?, ?, ?)", (username, 20, 10, 0))
+    cur.execute("INSERT INTO players (username, password) VALUES (?, ?)", (user, pwd))
+    cur.execute("INSERT INTO resources (username, wood, stone, iron, dynamite, gold) VALUES (?, 20, 10, 0, 0, 0)", (user,))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -105,26 +116,24 @@ def register():
 @app.route('/get_resources', methods=['POST'])
 def get_resources():
     data = request.json
-    username = data.get('username')
+    user = data.get('username')
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT wood, stone, dynamite FROM resources WHERE username=?", (username,))
-    res = cur.fetchone()
+    cur.execute("SELECT wood, stone, iron, dynamite, gold FROM resources WHERE username=?", (user,))
+    row = cur.fetchone()
     conn.close()
-    if res:
-        return jsonify({'wood': res['wood'], 'stone': res['stone'], 'dynamite': res['dynamite']})
-    return jsonify({'wood': 0, 'stone': 0, 'dynamite': 0})
+    if row:
+        return jsonify(dict(row))
+    return jsonify({'wood': 0, 'stone': 0, 'iron': 0, 'dynamite': 0, 'gold': 0})
 
 @app.route('/save_resources', methods=['POST'])
 def save_resources():
     data = request.json
-    username = data.get('username')
-    wood = data.get('wood')
-    stone = data.get('stone')
-    dynamite = data.get('dynamite')
+    user = data.get('username')
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE resources SET wood=?, stone=?, dynamite=? WHERE username=?", (wood, stone, dynamite, username))
+    cur.execute('''UPDATE resources SET wood=?, stone=?, iron=?, dynamite=?, gold=? WHERE username=?''',
+                (data['wood'], data['stone'], data['iron'], data['dynamite'], data['gold'], user))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
@@ -136,11 +145,11 @@ def get_world():
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT x, y, block_type, owner FROM world WHERE server_id=?", (server_id,))
-    cells = cur.fetchall()
+    rows = cur.fetchall()
     conn.close()
     world = {}
-    for cell in cells:
-        world[f"{cell['x']},{cell['y']}"] = {'type': cell['block_type'], 'owner': cell['owner']}
+    for row in rows:
+        world[f"{row['x']},{row['y']}"] = {'type': row['block_type'], 'owner': row['owner']}
     return jsonify(world)
 
 @app.route('/save_world', methods=['POST'])
@@ -174,25 +183,13 @@ def get_chat():
 @app.route('/send_chat', methods=['POST'])
 def send_chat():
     data = request.json
-    username = data.get('username')
-    message = data.get('message')
-    server_id = data.get('server_id', 1)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("INSERT INTO chat (username, message, server_id) VALUES (?, ?, ?)", (username, message, server_id))
+    cur.execute("INSERT INTO chat (username, message, server_id) VALUES (?, ?, ?)",
+                (data['username'], data['message'], data.get('server_id', 1)))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
-
-@app.route('/get_servers', methods=['GET'])
-def get_servers():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM servers")
-    rows = cur.fetchall()
-    conn.close()
-    servers = [dict(row) for row in rows]
-    return jsonify(servers)
 
 if __name__ == '__main__':
     init_db()
