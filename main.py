@@ -1,9 +1,10 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import libsql_client
 import hashlib
 import os
 import time
+import json
 from datetime import datetime
 
 app = Flask(__name__)
@@ -14,7 +15,8 @@ TURSO_URL = "libsql://vk-bot-cursedd.aws-eu-west-1.turso.io"
 TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODQyOTA1NDAsImlkIjoiMDE5ZjcwMDAtOTcwMS03NDJjLWIwM2EtNzA0MTQ2MDk4ZWI2Iiwia2lkIjoicWpYbEhLbElGQmJNX29uRDlaWEkyWFVfazVBT3h3X3JIMF9TcUZ6MmU0ZyIsInJpZCI6ImM3OTFiYzM5LTg3YjktNDgwZC1iZjRkLTEwMDdiNTI1YTg2NCJ9.rvnr8-mOPA7ydTmVKb1C4QDIxA_se-HSIiGQX5OaJ9vnj89C4xJ5PZnHn5ldw4eQMf-5pRXztvisg-chcKj4Dw"
 
 def get_db():
-    return libsql_client.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+    # Новый синтаксис для libsql-client 0.3.1
+    return libsql_client.connect_sync(TURSO_URL, auth_token=TURSO_TOKEN)
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -22,6 +24,7 @@ def hash_password(password):
 # ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ==========
 def init_db():
     conn = get_db()
+    
     # Таблица пользователей хостинга
     conn.execute("""
         CREATE TABLE IF NOT EXISTS hosting_users (
@@ -32,6 +35,7 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
     # Таблица серверов хостинга
     conn.execute("""
         CREATE TABLE IF NOT EXISTS hosting_servers (
@@ -47,7 +51,8 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES hosting_users(id)
         )
     """)
-    # Таблица серверов игры (основная)
+    
+    # Таблица серверов игры
     conn.execute("""
         CREATE TABLE IF NOT EXISTS servers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +64,8 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Таблица ресурсов игроков
+    
+    # Таблица ресурсов
     conn.execute("""
         CREATE TABLE IF NOT EXISTS resources (
             username TEXT PRIMARY KEY,
@@ -73,6 +79,7 @@ def init_db():
             upgraded_dynamite INTEGER DEFAULT 0
         )
     """)
+    
     # Таблица мира
     conn.execute("""
         CREATE TABLE IF NOT EXISTS world (
@@ -85,6 +92,7 @@ def init_db():
             PRIMARY KEY (x, y, server_id)
         )
     """)
+    
     # Таблица чата
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat (
@@ -95,10 +103,13 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
     # Создаём админа
     conn.execute("INSERT OR IGNORE INTO hosting_users (username, password, balance) VALUES ('cursed_pharaon', ?, 1000)", (hash_password('lokaloka1472'),))
+    
     # Создаём тестовый сервер
     conn.execute("INSERT OR IGNORE INTO servers (id, name, admin, size, wipe_days) VALUES (1, 'York Wibe', 'cursed_pharaon', 150, 30)")
+    
     conn.commit()
     conn.close()
 
@@ -143,7 +154,7 @@ def login():
         }
     })
 
-# ========== ПОЛУЧИТЬ СЕРВЕРА ПОЛЬЗОВАТЕЛЯ ==========
+# ========== ПОЛУЧИТЬ СЕРВЕРА ==========
 @app.route('/get_servers', methods=['POST'])
 def get_servers():
     data = request.json
@@ -201,17 +212,14 @@ def create_server():
         conn.close()
         return jsonify({'success': False, 'error': f'Недостаточно средств. Нужно {config["price"]} ₽'})
     
-    # Списываем деньги
     conn.execute("UPDATE hosting_users SET balance = balance - ? WHERE id=?", (config['price'], user_id))
     
-    # Создаём сервер в основной таблице
     conn.execute("""
         INSERT INTO servers (name, admin, size, wipe_days, tariff)
         VALUES (?, ?, ?, ?, ?)
     """, (server_name, admin_nick, config['size'], config['wipe'], tariff))
     server_id = conn.last_insert_rowid()
     
-    # Создаём запись в таблице хостинга
     conn.execute("""
         INSERT INTO hosting_servers (user_id, server_name, admin_nick, map_size, wipe_days, tariff, status)
         VALUES (?, ?, ?, ?, ?, ?, 'online')
@@ -222,25 +230,7 @@ def create_server():
     
     return jsonify({'success': True, 'server_id': server_id})
 
-# ========== ПОЛУЧИТЬ СПИСОК СЕРВЕРОВ ДЛЯ ИГРЫ ==========
-@app.route('/get_game_servers', methods=['GET'])
-def get_game_servers():
-    conn = get_db()
-    rows = conn.execute("SELECT id, name, admin, size, wipe_days, tariff FROM servers ORDER BY id").fetchall()
-    conn.close()
-    servers = []
-    for row in rows:
-        servers.append({
-            'id': row[0],
-            'name': row[1],
-            'admin': row[2],
-            'size': row[3],
-            'wipe_days': row[4],
-            'tariff': row[5]
-        })
-    return jsonify({'success': True, 'servers': servers})
-
-# ========== РЕСУРСЫ ==========
+# ========== ПОЛУЧИТЬ РЕСУРСЫ ==========
 @app.route('/get_resources', methods=['POST'])
 def get_resources():
     data = request.json
@@ -262,6 +252,7 @@ def get_resources():
         })
     return jsonify({'wood': 0, 'stone': 0, 'iron': 0, 'dynamite': 0, 'gold': 0, 'pickaxe': 0, 'axe': 0, 'upgraded_dynamite': 0})
 
+# ========== СОХРАНИТЬ РЕСУРСЫ ==========
 @app.route('/save_resources', methods=['POST'])
 def save_resources():
     data = request.json
@@ -277,7 +268,7 @@ def save_resources():
     conn.close()
     return jsonify({'success': True})
 
-# ========== МИР ==========
+# ========== ПОЛУЧИТЬ МИР ==========
 @app.route('/get_world', methods=['POST'])
 def get_world():
     data = request.json
@@ -294,6 +285,7 @@ def get_world():
         }
     return jsonify(world)
 
+# ========== СОХРАНИТЬ МИР ==========
 @app.route('/save_world', methods=['POST'])
 def save_world():
     data = request.json
@@ -311,7 +303,7 @@ def save_world():
     conn.close()
     return jsonify({'success': True})
 
-# ========== ЧАТ ==========
+# ========== ОТПРАВИТЬ СООБЩЕНИЕ В ЧАТ ==========
 @app.route('/send_chat', methods=['POST'])
 def send_chat():
     data = request.json
@@ -324,6 +316,7 @@ def send_chat():
     conn.close()
     return jsonify({'success': True})
 
+# ========== ПОЛУЧИТЬ ЧАТ ==========
 @app.route('/get_chat', methods=['POST'])
 def get_chat():
     data = request.json
@@ -357,8 +350,25 @@ def stream_chat():
             except Exception as e:
                 print("SSE ошибка:", e)
                 time.sleep(1)
-    from flask import Response, stream_with_context
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+# ========== ПОЛУЧИТЬ СПИСОК СЕРВЕРОВ ДЛЯ ИГРЫ ==========
+@app.route('/get_game_servers', methods=['GET'])
+def get_game_servers():
+    conn = get_db()
+    rows = conn.execute("SELECT id, name, admin, size, wipe_days, tariff FROM servers ORDER BY id").fetchall()
+    conn.close()
+    servers = []
+    for row in rows:
+        servers.append({
+            'id': row[0],
+            'name': row[1],
+            'admin': row[2],
+            'size': row[3],
+            'wipe_days': row[4],
+            'tariff': row[5]
+        })
+    return jsonify({'success': True, 'servers': servers})
 
 # ========== ЗАПУСК ==========
 if __name__ == '__main__':
