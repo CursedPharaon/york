@@ -1,24 +1,18 @@
-import asyncio
-import websockets
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+import sqlite3
 import hashlib
 import time
 import threading
 import requests
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-import sqlite3
-import os
-from datetime import datetime, timedelta
+import asyncio
+import websockets
+from datetime import datetime
 
 # ============ БАЗА ДАННЫХ ============
-DB_URL = "libsql://york-true-cursedd.aws-eu-west-1.turso.io"
-DB_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODUyNTkyNzEsImlkIjoiMDE5ZmE5YmUtNjUwMS03MmMwLTkzZjAtMTA1YWYwOWNlOWZmIiwia2lkIjoicWpYbEhLbElGQmJNX29uRDlaWEkyWFVfazVBT3h3X3JIMF9TcUZ6MmU0ZyIsInJpZCI6IjE0MzQ1ODQxLWU4ZTktNDc4NS1hNjA2LTFhNGQ3ZTY2NzdhZiJ9.17Kv3A2DdBdJjoJa_kt1W5ed5qCN3f5TERlMt8yuAr-wcsenICQFGkiLeEWeX02CkDzO2DMzD0JbfRaryKbgBA"
-
-# Используем SQLite локально + синхронизация с Turso (упрощенно)
 conn = sqlite3.connect('york.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Создание таблиц
 cursor.executescript('''
     CREATE TABLE IF NOT EXISTS users (
         nick TEXT PRIMARY KEY,
@@ -37,14 +31,12 @@ cursor.executescript('''
         owner TEXT,
         mapSizeX INTEGER DEFAULT 300,
         mapSizeY INTEGER DEFAULT 300,
-        maxPlayers INTEGER DEFAULT 35,
-        created TEXT
+        maxPlayers INTEGER DEFAULT 35
     );
     CREATE TABLE IF NOT EXISTS server_admins (
         server_name TEXT,
         nick TEXT,
-        level INTEGER, -- 1:helper,2:moder,3:senior_moder,4:curator,5:head_admin
-        PRIMARY KEY (server_name, nick)
+        level INTEGER
     );
     CREATE TABLE IF NOT EXISTS bans (
         server_name TEXT,
@@ -52,291 +44,221 @@ cursor.executescript('''
         until TEXT,
         reason TEXT
     );
-    CREATE TABLE IF NOT EXISTS player_prefixes (
-        server_name TEXT,
-        nick TEXT,
-        prefix TEXT
-    );
 ''')
 conn.commit()
 
-# ============ ИНИЦИАЛИЗАЦИЯ СЕРВЕРА YORKTRUE ============
-def init_default_server():
-    cursor.execute("SELECT name FROM servers WHERE name='YorkTrue'")
-    if not cursor.fetchone():
-        cursor.execute('''
-            INSERT INTO servers (name, firstIp, secondIp, owner, mapSizeX, mapSizeY, maxPlayers, created)
-            VALUES ('YorkTrue', 'free.YorkTrue.york', '', 'cursed_pharaon', 300, 300, 35, datetime('now'))
-        ''')
-        cursor.execute("INSERT INTO server_admins VALUES ('YorkTrue', 'cursed_pharaon', 6)")  # 6 = owner
-        conn.commit()
-        print("[INIT] Сервер YorkTrue создан")
+# Создаем дефолтный сервер если нет
+cursor.execute("SELECT name FROM servers WHERE name='YorkTrue'")
+if not cursor.fetchone():
+    cursor.execute("INSERT INTO servers VALUES ('YorkTrue', 'free.YorkTrue.york', '', 'cursed_pharaon', 300, 300, 35)")
+    cursor.execute("INSERT INTO server_admins VALUES ('YorkTrue', 'cursed_pharaon', 6)")
+    conn.commit()
+    print("[OK] Сервер YorkTrue создан")
 
-init_default_server()
+# ============ HTTP ОБРАБОТЧИК ============
+class Handler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
 
-# ============ ИГРОВОЕ СОСТОЯНИЕ ============
-class GameServer:
-    def __init__(self, name):
-        self.name = name
-        cursor.execute("SELECT mapSizeX, mapSizeY, maxPlayers FROM servers WHERE name=?", (name,))
-        row = cursor.fetchone()
-        self.mapW = row[0] if row else 300
-        self.mapH = row[1] if row else 300
-        self.maxPlayers = row[2] if row else 35
-        self.map = [['grass' for _ in range(self.mapW)] for _ in range(self.mapH)]
-        self.blockOwners = {}  # (x,y) -> nick
-        self.blockData = {}    # (x,y) -> {'type','hp'}
-        self.players = {}      # nick -> {'x','y','inventory','prefix'}
-        self.systemMessages = {}  # msg -> interval
-        self.generateResources()
-
-    def generateResources(self):
-        import random
-        for _ in range(int(self.mapW * self.mapH * 0.15)):
-            x, y = random.randint(0, self.mapW-1), random.randint(0, self.mapH-1)
-            r = random.random()
-            if r < 0.5: block = 'wood'
-            elif r < 0.8: block = 'stone'
-            elif r < 0.95: block = 'gold_ore'
-            else: block = 'diamond_ore'
-            self.map[y][x] = block
-
-    def canJoin(self, nick):
-        # Проверка бана
-        cursor.execute("SELECT until FROM bans WHERE server_name=? AND nick=? AND until > datetime('now')", (self.name, nick))
-        if cursor.fetchone():
-            return False
-        return len(self.players) < self.maxPlayers
-
-    def getPlayerPrefix(self, nick):
-        cursor.execute("SELECT prefix FROM player_prefixes WHERE server_name=? AND nick=?", (self.name, nick))
-        row = cursor.fetchone()
-        if row and row[0]: return row[0]
-        cursor.execute("SELECT level FROM server_admins WHERE server_name=? AND nick=?", (self.name, nick))
-        adm = cursor.fetchone()
-        if adm:
-            levels = {1:'[Хелпер]', 2:'[Модер]', 3:'[Ст.Модер]', 4:'[Куратор]', 5:'[Гл.Админ]', 6:'[Владелец]'}
-            return levels.get(adm[0], '[Игрок]')
-        return '[Игрок]'
-
-    def handleCommand(self, nick, msg):
-        parts = msg.split(' ')
-        cmd = parts[0].lower()
-        prefix = self.getPlayerPrefix(nick)
-
-        # /kick
-        if cmd == '/kick' and prefix in ['[Гл.Админ]','[Владелец]']:
-            target = parts[1] if len(parts) > 1 else None
-            if target and target in self.players:
-                cursor.execute("INSERT OR REPLACE INTO bans VALUES (?,?,datetime('now','+20 minutes'),'Kicked')", (self.name, target))
-                conn.commit()
-                del self.players[target]
-                return f"Игрок {target} выгнан на 20 минут"
-
-        # /ban
-        elif cmd == '/ban' and prefix in ['[Гл.Админ]','[Владелец]']:
-            try:
-                hours = int(parts[1])
-                target = parts[3] if len(parts) > 3 else parts[2]
-                reason = ' '.join(parts[2:-1]) if len(parts) > 3 else 'Нарушение'
-                cursor.execute("INSERT OR REPLACE INTO bans VALUES (?,?,datetime('now','+{} hours'),?)".format(hours), (self.name, target, reason))
-                conn.commit()
-                if target in self.players: del self.players[target]
-                return f"Игрок {target} забанен на {hours}ч. Причина: {reason}"
-            except: return "Формат: /ban 24 Причина Ник"
-
-        # /systemmessage
-        elif cmd == '/systemmessage' and prefix in ['[Владелец]']:
-            try:
-                interval = int(parts[-1])
-                text = ' '.join(parts[1:-1])
-                self.systemMessages[text] = interval
-                return f"Системное сообщение установлено каждые {interval} мин"
-            except: return "Формат: /systemmessage Текст Интервал"
-
-        # /addadmin
-        elif cmd == '/addadmin' and prefix in ['[Гл.Админ]','[Владелец]']:
-            try:
-                target = parts[1]
-                level = int(parts[2])
-                if level < 1 or level > 5: return "Уровень 1-5"
-                cursor.execute("INSERT OR REPLACE INTO server_admins VALUES (?,?,?)", (self.name, target, level))
-                conn.commit()
-                return f"Админ {target} добавлен (ур.{level})"
-            except: return "Формат: /addadmin Ник Уровень"
-
-        # /removeadmin
-        elif cmd == '/removeadmin' and prefix in ['[Гл.Админ]','[Владелец]']:
-            try:
-                target = parts[1]
-                cursor.execute("DELETE FROM server_admins WHERE server_name=? AND nick=?", (self.name, target))
-                conn.commit()
-                return f"Админ {target} удален"
-            except: return "Формат: /removeadmin Ник"
-
-        # /setprefix (для куратора+)
-        elif cmd == '/setprefix' and prefix in ['[Куратор]','[Гл.Админ]','[Владелец]']:
-            try:
-                target = parts[1]
-                newPrefix = parts[2]
-                cursor.execute("INSERT OR REPLACE INTO player_prefixes VALUES (?,?,?)", (self.name, target, newPrefix))
-                conn.commit()
-                return f"Префикс {target} изменен на {newPrefix}"
-            except: return "Формат: /setprefix Ник Префикс"
-
-        return None
-
-# Хранилище активных серверов
-gameServers = {}
-
-def getOrCreateServer(name):
-    if name not in gameServers:
-        gameServers[name] = GameServer(name)
-    return gameServers[name]
-
-# ============ WEBSOCKET ОБРАБОТЧИК ============
-async def ws_handler(websocket, path):
-    server_name = path.split('/ws/')[-1] if '/ws/' in path else 'YorkTrue'
-    gs = getOrCreateServer(server_name)
-    nick = None
-
-    try:
-        async for message in websocket:
-            data = json.loads(message)
-
-            if data['type'] == 'auth':
-                nick = data['nick']
-                session = data['session']
-                # Проверка сессии
-                cursor.execute("SELECT nick FROM sessions WHERE session=? AND expires > datetime('now')", (session,))
-                if not cursor.fetchone():
-                    await websocket.send(json.dumps({'type': 'error', 'msg': 'Сессия истекла'}))
-                    continue
-                if not gs.canJoin(nick):
-                    await websocket.send(json.dumps({'type': 'kicked'}))
-                    continue
-                gs.players[nick] = {'x': 10, 'y': 10, 'inventory': [], 'prefix': gs.getPlayerPrefix(nick)}
-                await websocket.send(json.dumps({'type': 'state', 'state': gs.getState()}))
-
-            elif data['type'] == 'click' and nick:
-                x, y = data['x'], data['y']
-                slot = data.get('slot', 0)
-                if 0 <= x < gs.mapW and 0 <= y < gs.mapH:
-                    block = gs.map[y][x]
-                    # Рубка ресурсов
-                    if block in ['wood','stone','gold_ore','diamond_ore']:
-                        gs.map[y][x] = 'grass'
-                        # Через время трава восстановится (упрощенно)
-                        await asyncio.sleep(30)
-                        if gs.map[y][x] == 'grass':
-                            gs.map[y][x] = block
-                    # Строительство
-                    elif block == 'grass' and slot < len(gs.players[nick]['inventory']):
-                        item = gs.players[nick]['inventory'][slot]
-                        if item['type'] in ['wood_block','stone_block','obsidian','tnt']:
-                            gs.map[y][x] = item['type']
-                            gs.blockOwners[(x,y)] = nick
-
-            elif data['type'] == 'chat' and nick:
-                msg = data['msg']
-                if msg.startswith('/'):
-                    result = gs.handleCommand(nick, msg)
-                    if result:
-                        await websocket.send(json.dumps({'type': 'chat', 'msg': f'[СИСТЕМА] {result}'}))
-                else:
-                    prefix = gs.getPlayerPrefix(nick)
-                    chatMsg = f'{prefix} {nick}: {msg}'
-                    # Рассылка всем
-                    for pNick, pData in gs.players.items():
-                        # Отправка через websocket (упрощенно)
-                        pass
-
-            # Отправка состояния
-            await websocket.send(json.dumps({'type': 'state', 'state': gs.getState()}))
-
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        if nick and nick in gs.players:
-            del gs.players[nick]
-
-# ============ HTTP СЕРВЕР ============
-class APIHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        body = self.rfile.read(content_length)
-        data = json.loads(body)
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b'{}'
+        
+        try:
+            data = json.loads(body)
+        except:
+            self.send_json({'error': 'Invalid JSON'})
+            return
+
+        print(f"[POST] {self.path} data={data}")
 
         if self.path == '/api/register':
-            nick = data['nick']
-            password = hashlib.sha256(data['password'].encode()).hexdigest()
+            nick = data.get('nick', '').strip()
+            password = data.get('password', '').strip()
+            
+            if not nick or not password:
+                self.send_json({'error': 'Заполните все поля'})
+                return
+            
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
+            
             try:
-                cursor.execute("INSERT INTO users VALUES (?,?,datetime('now'))", (nick, password))
+                cursor.execute("INSERT INTO users VALUES (?, ?, datetime('now'))", (nick, password_hash))
                 conn.commit()
+                print(f"[OK] Зарегистрирован: {nick}")
                 self.send_json({'ok': True})
-            except:
-                self.send_json({'error': 'Ник занят'})
+            except sqlite3.IntegrityError:
+                self.send_json({'error': 'Ник уже занят'})
+            except Exception as e:
+                self.send_json({'error': str(e)})
 
         elif self.path == '/api/login':
-            nick = data['nick']
-            password = hashlib.sha256(data['password'].encode()).hexdigest()
+            nick = data.get('nick', '').strip()
+            password = data.get('password', '').strip()
+            
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
             cursor.execute("SELECT password FROM users WHERE nick=?", (nick,))
             row = cursor.fetchone()
-            if row and row[0] == password:
+            
+            if row and row[0] == password_hash:
                 session = hashlib.sha256(f"{nick}{time.time()}".encode()).hexdigest()
-                cursor.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,datetime('now','+24 hours'))", (nick, session))
+                cursor.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, datetime('now', '+24 hours'))", (nick, session))
                 conn.commit()
+                print(f"[OK] Вход: {nick}")
                 self.send_json({'session': session})
             else:
-                self.send_json({'error': 'Неверный логин/пароль'})
+                self.send_json({'error': 'Неверный логин или пароль'})
+
+        else:
+            self.send_json({'error': f'Unknown path: {self.path}'})
 
     def do_GET(self):
+        print(f"[GET] {self.path}")
+        
         if self.path == '/api/servers':
             cursor.execute("SELECT name, firstIp, secondIp, maxPlayers FROM servers")
             servers = []
             for row in cursor.fetchall():
-                gs = getOrCreateServer(row[0])
                 servers.append({
                     'name': row[0],
                     'firstIp': row[1],
-                    'secondIp': row[2],
+                    'secondIp': row[2] or '',
                     'maxPlayers': row[3],
-                    'players': len(gs.players)
+                    'players': 0
                 })
             self.send_json(servers)
+        
+        elif self.path == '/ping':
+            self.send_json({'status': 'ok', 'time': str(datetime.now())})
+        
+        elif self.path == '/' or self.path == '/index.html':
+            try:
+                with open('york.html', 'r', encoding='utf-8') as f:
+                    html = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(html.encode('utf-8'))
+            except:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(b'<h1>York Server OK</h1><p>API is working</p>')
+        
         else:
-            super().do_GET()
+            self.send_response(404)
+            self.end_headers()
 
     def send_json(self, data):
         self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+    def log_message(self, format, *args):
+        print(f"[HTTP] {args[0]}")
+
+# ============ WEBSOCKET ============
+gameServers = {}
+
+class GameServer:
+    def __init__(self, name):
+        self.name = name
+        self.mapW = 300
+        self.mapH = 300
+        self.maxPlayers = 35
+        self.map = [['grass' for _ in range(self.mapW)] for _ in range(self.mapH)]
+        self.players = {}
+        self.blockOwners = {}
+        
+        import random
+        for _ in range(500):
+            x, y = random.randint(0, self.mapW-1), random.randint(0, self.mapH-1)
+            self.map[y][x] = random.choice(['wood', 'stone', 'gold_ore'])
+
+    def getState(self):
+        return {
+            'map': self.map,
+            'players': self.players
+        }
+
+async def ws_handler(websocket, path):
+    server_name = path.split('/ws/')[-1] if '/ws/' in path else 'YorkTrue'
+    
+    if server_name not in gameServers:
+        gameServers[server_name] = GameServer(server_name)
+    
+    gs = gameServers[server_name]
+    nick = None
+    print(f"[WS] Новое подключение к {server_name}")
+
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            
+            if data.get('type') == 'auth':
+                nick = data.get('nick', 'anonymous')
+                gs.players[nick] = {'x': 10, 'y': 10, 'nick': nick}
+                await websocket.send(json.dumps({'type': 'state', 'state': gs.getState()}))
+                print(f"[WS] {nick} зашел на {server_name}")
+            
+            elif data.get('type') == 'chat':
+                msg = data.get('msg', '')
+                print(f"[CHAT] {nick}: {msg}")
+                await websocket.send(json.dumps({'type': 'chat', 'msg': f'[Игрок] {nick}: {msg}'}))
+            
+            elif data.get('type') == 'click':
+                x, y = data.get('x', 0), data.get('y', 0)
+                if 0 <= y < len(gs.map) and 0 <= x < len(gs.map[0]):
+                    block = gs.map[y][x]
+                    if block in ['wood', 'stone', 'gold_ore']:
+                        gs.map[y][x] = 'grass'
+                        print(f"[WS] {nick} сломал {block} на {x},{y}")
+                    elif block == 'grass':
+                        gs.map[y][x] = 'wood_block'
+                        gs.blockOwners[(x,y)] = nick
+                        print(f"[WS] {nick} поставил блок на {x},{y}")
+                
+                await websocket.send(json.dumps({'type': 'state', 'state': gs.getState()}))
+
+    except websockets.exceptions.ConnectionClosed:
+        print(f"[WS] Отключение")
+    finally:
+        if nick and nick in gs.players:
+            del gs.players[nick]
 
 # ============ САМОПИНГ ============
 def self_ping():
     while True:
         try:
-            requests.get('https://york-server-ffa3.onrender.com', timeout=10)
-            print(f"[PING] {datetime.now()} - OK")
+            r = requests.get('https://york-server-ffa3.onrender.com/ping', timeout=10)
+            print(f"[PING] {datetime.now()} - Status: {r.status_code}")
         except Exception as e:
             print(f"[PING] Error: {e}")
-        time.sleep(300)  # 5 минут
+        time.sleep(300)
 
 # ============ ЗАПУСК ============
 async def main():
-    # HTTP сервер в отдельном потоке
-    httpd = HTTPServer(('0.0.0.0', 8000), APIHandler)
+    # HTTP
+    httpd = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 8000))), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"[HTTP] Сервер запущен на порту {os.environ.get('PORT', 8000)}")
 
-    # WebSocket сервер
-    ws_server = await websockets.serve(ws_handler, '0.0.0.0', 8080)
-
-    # Самопинг
-    threading.Thread(target=self_ping, daemon=True).start()
-
-    print("Сервер запущен: HTTP:8000, WS:8080")
-    await asyncio.Future()
+    # WebSocket
+    ws_port = int(os.environ.get('PORT', 8080))
+    async with websockets.serve(ws_handler, '0.0.0.0', ws_port):
+        print(f"[WS] WebSocket запущен на порту {ws_port}")
+        await asyncio.Future()
 
 if __name__ == '__main__':
+    import os
+    # Запускаем самопинг в фоне
+    threading.Thread(target=self_ping, daemon=True).start()
+    # Запускаем сервер
     asyncio.run(main())
